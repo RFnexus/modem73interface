@@ -13,7 +13,6 @@
 #     control_port = 8073
 #     # Optional, defaults shown:
 #     # mtu_overhead = 15
-#     # bitrate = 600
 #     # short_frames = off      # off | auto | always
 #     # short_mtu = 170
 #     # handshake_x2 = no       # send link handshake packets twice
@@ -36,7 +35,7 @@ class Modem73Interface(TCPClientInterface):
     DEFAULT_KISS_PORT     = 8001
     DEFAULT_CONTROL_PORT  = 8073
     DEFAULT_MTU_OVERHEAD  = 15
-    DEFAULT_BITRATE       = 600
+    DEFAULT_BITRATE       = 400
     DEFAULT_SHORT_MTU     = 170
 
     CONTROL_RECONNECT_WAIT = 5
@@ -53,6 +52,8 @@ class Modem73Interface(TCPClientInterface):
     ROBUST_SHORT_OFFSET = 5
     ROBUST_MODE_MAX     = 9
     ROBUST_BPS = [1150, 585, 296, 296, 149, 732, 378, 194, 197, 99]
+    # Timeout-oriented effective bitrates
+    ROBUST_TIMEOUT_BPS = [295, 100, 75, 75, 38, 185, 95, 50, 50, 25]
 
     PKT_LINKREQUEST = 0x02
     CTX_LRRTT       = 0xFE
@@ -119,7 +120,8 @@ class Modem73Interface(TCPClientInterface):
         super().__init__(owner, c)
 
         # pin our advertisted bitrate
-        self.bitrate = self._fixed_bitrate 
+        self.bitrate = self._fixed_bitrate
+        self._apply_path_request_window()
 
         # track config changes
         self._control_thread = threading.Thread(target=self._control_loop, daemon=True)
@@ -300,6 +302,19 @@ class Modem73Interface(TCPClientInterface):
         if self._short_policy == "always" and not self._always_applied:
             self._apply_always_short(cfg)
 
+    def _apply_path_request_window(self):
+        if not self.bitrate:
+            return
+        needed = int(3 * (RNS.Reticulum.MTU * 8 / self.bitrate)) + 10
+        current = RNS.Transport.PATH_REQUEST_TIMEOUT
+        if needed > current:
+            RNS.Transport.PATH_REQUEST_TIMEOUT = needed
+            RNS.log(
+                f"Modem73Interface[{self.name if hasattr(self, 'name') else 'm73'}]: "
+                f"path request window {current}s -> {needed}s for {self.bitrate} bps channel",
+                RNS.LOG_INFO,
+            )
+
     ### SHORT FRAME HANDLING
 
     def _update_short_mode(self, cfg):
@@ -309,7 +324,7 @@ class Modem73Interface(TCPClientInterface):
         if modem_type == self.MODEM_ROBUST:
             rm = cfg.get("robust_mode")
             if self._auto_bitrate and rm is not None and 0 <= rm <= self.ROBUST_MODE_MAX:
-                new_bitrate = self.ROBUST_BPS[rm]
+                new_bitrate = self.ROBUST_TIMEOUT_BPS[rm]
                 if new_bitrate != self.bitrate:
                     RNS.log(
                         f"Modem73Interface[{self.name}]: bitrate {self.bitrate} -> "
@@ -317,6 +332,7 @@ class Modem73Interface(TCPClientInterface):
                         RNS.LOG_INFO,
                     )
                     self.bitrate = new_bitrate
+                    self._apply_path_request_window()
             if rm is not None and rm < self.ROBUST_SHORT_OFFSET:
                 override = rm + self.ROBUST_SHORT_OFFSET
                 self._short_mtu = min(self._short_mtu, self.DEFAULT_SHORT_MTU)
