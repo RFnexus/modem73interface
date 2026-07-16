@@ -69,7 +69,7 @@ class Modem73Interface(TCPClientInterface):
         mtu_overhead = int(c["mtu_overhead"]) if "mtu_overhead" in c else self.DEFAULT_MTU_OVERHEAD
         bitrate      = int(c["bitrate"]) if "bitrate" in c else self.DEFAULT_BITRATE
         auto_frag    = c.as_bool("auto_fragmentation") if "auto_fragmentation" in c else True
-        short_frames = str(c["short_frames"]).lower() if "short_frames" in c else "off"
+        short_frames = str(c["short_frames"]).lower() if "short_frames" in c else "auto"
         short_mtu    = int(c["short_mtu"]) if "short_mtu" in c else self.DEFAULT_SHORT_MTU
         handshake_x2 = c.as_bool("handshake_x2") if "handshake_x2" in c else False
         auto_bitrate = c.as_bool("auto_bitrate") if "auto_bitrate" in c else True
