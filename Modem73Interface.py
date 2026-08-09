@@ -13,7 +13,7 @@
 #     control_port = 8073
 #     # Optional, defaults shown:
 #     # mtu_overhead = 15
-#     # short_frames = auto      # off | auto | always
+#     # short_frames = auto      # Leave this on auto for best performance
 #     # short_mtu = 170
 
 import base64
@@ -181,13 +181,16 @@ class Modem73Interface(TCPClientInterface):
             )
 
         if self._auto_frag:
-            want_frag = self._needs_fragmentation(payload_size)
+            short_active = self._short_policy != "off"
+            want_frag = self._needs_fragmentation(payload_size) and not short_active
             if want_frag != self._frag_target:
                 if self._set_fragmentation(want_frag):
                     self._frag_target = want_frag
+                    reason = (" (auto framing handles short packets)"
+                              if short_active and not want_frag else "")
                     RNS.log(
                         f"Modem73Interface[{self.name}]: fragmentation "
-                        f"{'enabled' if want_frag else 'disabled'} "
+                        f"{'enabled' if want_frag else 'disabled'}{reason} "
                         f"(payload_size={payload_size}, threshold={RNS.Reticulum.MTU + self.mtu_overhead})",
                         RNS.LOG_INFO,
                     )
