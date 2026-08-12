@@ -84,6 +84,7 @@ class Modem73Interface(TCPClientInterface):
     CSMA_SYNC = 1
     CSMA_RANKED = 2
     DEFAULT_TIMEOUT_MARGIN = 0.35
+    MIN_CHANNEL_SHARE = 0.25
 
     PKT_LINKREQUEST = 0x02
     PKT_PROOF       = 0x03
@@ -372,25 +373,26 @@ class Modem73Interface(TCPClientInterface):
 
     def _update_channel_load(self, msg):
         try:
-            pop = msg.get("population")
+            changed = False
             occ = msg.get("occupancy_pct")
             if occ is not None:
-                self._occupancy_pct = max(0, min(100, int(occ)))
-            if pop is None:
-                return
-            pop = int(pop)
-            if pop < 0:
-                return
-            if pop == self._population:
-                return
-            self._population = pop
-            self.csma_population = pop
-            RNS.log(
-                f"Modem73Interface[{self.name}]: channel population {pop} "
-                f"other station(s), occupancy {self._occupancy_pct}%",
-                RNS.LOG_INFO,
-            )
-            if self._last_cfg is not None:
+                occ = max(0, min(100, int(occ)))
+                if occ // 10 != self._occupancy_pct // 10:
+                    changed = True
+                self._occupancy_pct = occ
+            pop = msg.get("population")
+            if pop is not None:
+                pop = int(pop)
+                if pop >= 0 and pop != self._population:
+                    self._population = pop
+                    self.csma_population = pop
+                    RNS.log(
+                        f"Modem73Interface[{self.name}]: channel population {pop} "
+                        f"other station(s), occupancy {self._occupancy_pct}%",
+                        RNS.LOG_INFO,
+                    )
+                    changed = True
+            if changed and self._last_cfg is not None:
                 self._maybe_update_bitrate(self._last_cfg)
         except Exception as e:
             RNS.log(
@@ -494,7 +496,6 @@ class Modem73Interface(TCPClientInterface):
             slots = min(16, max(6, 3 * stations))
             window = max(slots * (det + 0.15),
                          cw * slot_ms / 500.0,
-                         16 * det,
                          4 * slot_ms / 1000.0)
         else:
             window = cw * slot_ms / 1000.0
@@ -517,9 +518,9 @@ class Modem73Interface(TCPClientInterface):
         overhead = self._csma_per_frame_overhead(cfg, air)
         duty = air / (air + overhead) if overhead > 0 else 1.0
         share = 1.0
-        if cfg.get("csma_enabled", self._csma_default) and self._population > 0:
-            share = 1.0 / (1 + self._population)
-        return max(8, int(phy * duty * share * self._timeout_margin))
+        if cfg.get("csma_enabled", self._csma_default):
+            share = max(1.0 - self._occupancy_pct / 100.0, self.MIN_CHANNEL_SHARE)
+        return max(8, int(phy * duty * share))
 
     def _maybe_update_bitrate(self, cfg):
         if not self._auto_bitrate:
@@ -529,8 +530,7 @@ class Modem73Interface(TCPClientInterface):
             RNS.log(
                 f"Modem73Interface[{self.name}]: bitrate {self.bitrate} -> "
                 f"{new_bitrate}"
-                + (" (CSMA-aware)" if self._csma_overhead else "")
-                + " (TNC config change)",
+                + (" (CSMA-aware)" if self._csma_overhead else ""),
                 RNS.LOG_INFO,
             )
             self.bitrate = new_bitrate
