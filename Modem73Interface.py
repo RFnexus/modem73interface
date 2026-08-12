@@ -175,7 +175,7 @@ class Modem73Interface(TCPClientInterface):
 
         # pin our advertisted bitrate
         self.bitrate = self._fixed_bitrate
-        self._apply_path_request_window()
+
         if self._initial_cfg is not None:
             self._sync_from_config(self._initial_cfg)
 
@@ -534,20 +534,6 @@ class Modem73Interface(TCPClientInterface):
                 RNS.LOG_INFO,
             )
             self.bitrate = new_bitrate
-            self._apply_path_request_window()
-
-    def _apply_path_request_window(self):
-        if not self.bitrate:
-            return
-        needed = int(3 * (RNS.Reticulum.MTU * 8 / self.bitrate)) + 10
-        current = RNS.Transport.PATH_REQUEST_TIMEOUT
-        if needed > current:
-            RNS.Transport.PATH_REQUEST_TIMEOUT = needed
-            RNS.log(
-                f"Modem73Interface[{self.name if hasattr(self, 'name') else 'm73'}]: "
-                f"path request window {current}s -> {needed}s for {self.bitrate} bps channel",
-                RNS.LOG_INFO,
-            )
 
     ### SHORT FRAME HANDLING
 
