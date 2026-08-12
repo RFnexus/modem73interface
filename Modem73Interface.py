@@ -36,6 +36,7 @@ class Modem73Interface(TCPClientInterface):
     DEFAULT_MTU_OVERHEAD  = 15
     DEFAULT_BITRATE       = 400
     DEFAULT_SHORT_MTU     = 170
+    FRAG_HEADER_SIZE      = 5
 
     CONTROL_RECONNECT_WAIT = 5
     CONTROL_CONNECT_TIMEOUT = 5
@@ -49,15 +50,19 @@ class Modem73Interface(TCPClientInterface):
     OFDM_CODE_RATES  = ["1/2", "2/3", "3/4", "5/6", "1/4", "1/2x2", "1/4x2"]
 
     ROBUST_SHORT_OFFSET = 5
-    ROBUST_MODE_MAX     = 9
-    ROBUST_BPS = [1150, 585, 296, 296, 149, 732, 378, 194, 197, 99]
+    ROBUST_MODE_MAX     = 12
+    ROBUST_SHORT_MODE   = {0: 5, 1: 6, 2: 7, 3: 8, 4: 9, 10: 11}
+    ROBUST_BPS = [1150, 585, 296, 296, 149, 732, 378, 194, 197, 99,
+                  782, 513, 474]
     # Timeout-oriented effective bitrates (legacy static table, csma_overhead = no)
-    ROBUST_TIMEOUT_BPS = [295, 100, 75, 75, 38, 185, 95, 50, 50, 25]
+    ROBUST_TIMEOUT_BPS = [295, 100, 75, 75, 38, 185, 95, 50, 50, 25,
+                          196, 128, 118]
     MFSK_TIMEOUT_BPS   = 10
 
     # Frame airtimes in seconds, for CSMA-aware effective bitrate
     ROBUST_AIRTIME = [3.56, 7.00, 13.80, 13.80, 27.48,
-                      1.88, 3.64, 7.08, 7.00, 13.88]
+                      1.88, 3.64, 7.08, 7.00, 13.88,
+                      5.24, 2.68, 0.54]
     # (short, normal, long) airtime per OFDM modulation family
     OFDM_AIRTIME = {
         "BPSK":    (1.64, 2.73, 4.92),
@@ -71,6 +76,13 @@ class Modem73Interface(TCPClientInterface):
     }
     CSMA_KEYUP_S = 0.65
     CSMA_BURST_GAP_S = 0.2
+    RANKED_SLOT_S = 1.5
+    RANKED_YIELD_BUCKETS = 4
+    RANKED_QUIET_S = 1.0
+    LEAD_TONE_S = 0.8
+    CSMA_THRESHOLD = 0
+    CSMA_SYNC = 1
+    CSMA_RANKED = 2
     DEFAULT_TIMEOUT_MARGIN = 0.35
 
     PKT_LINKREQUEST = 0x02
@@ -94,6 +106,7 @@ class Modem73Interface(TCPClientInterface):
         proof_x2     = c.as_bool("proof_x2") if "proof_x2" in c else False
         auto_bitrate = c.as_bool("auto_bitrate") if "auto_bitrate" in c else True
         csma_overhead = c.as_bool("csma_overhead") if "csma_overhead" in c else True
+        csma          = c.as_bool("csma") if "csma" in c else True
         timeout_margin = float(c["timeout_margin"]) if "timeout_margin" in c else self.DEFAULT_TIMEOUT_MARGIN
 
         if short_frames not in ("off", "auto", "always"):
@@ -116,6 +129,7 @@ class Modem73Interface(TCPClientInterface):
 
         self._short_policy      = short_frames
         self._short_mtu         = short_mtu
+        self._short_mtu_cfg     = short_mtu
         self._short_oper_mode   = None
         self._short_tx_count    = 0
         self._always_applied    = False
@@ -126,6 +140,14 @@ class Modem73Interface(TCPClientInterface):
         self._timeout_margin    = max(0.05, min(1.0, timeout_margin))
         self._last_cfg          = None
         self._initial_cfg       = None
+        self._population        = 0
+        self._occupancy_pct     = 0
+        self._status_interval   = 30
+        self._last_status_req   = 0
+
+        self._csma_default      = csma
+        self.csma_enabled       = csma
+        self.csma_population    = 0
 
         self.r_stat_rssi = None
         self.r_stat_snr  = None
@@ -181,16 +203,13 @@ class Modem73Interface(TCPClientInterface):
             )
 
         if self._auto_frag:
-            short_active = self._short_policy != "off"
-            want_frag = self._needs_fragmentation(payload_size) and not short_active
+            want_frag = self._needs_fragmentation(payload_size)
             if want_frag != self._frag_target:
                 if self._set_fragmentation(want_frag):
                     self._frag_target = want_frag
-                    reason = (" (auto framing handles short packets)"
-                              if short_active and not want_frag else "")
                     RNS.log(
                         f"Modem73Interface[{self.name}]: fragmentation "
-                        f"{'enabled' if want_frag else 'disabled'}{reason} "
+                        f"{'enabled' if want_frag else 'disabled'} "
                         f"(payload_size={payload_size}, threshold={RNS.Reticulum.MTU + self.mtu_overhead})",
                         RNS.LOG_INFO,
                     )
@@ -270,7 +289,7 @@ class Modem73Interface(TCPClientInterface):
                     (self.control_host, self.control_port),
                     timeout=self.CONTROL_CONNECT_TIMEOUT,
                 )
-                s.settimeout(None)
+                s.settimeout(self._status_interval)
                 self._control_socket = s
                 RNS.log(
                     f"Modem73Interface[{self.name}]: control port connected "
@@ -290,11 +309,23 @@ class Modem73Interface(TCPClientInterface):
 
 
 
+                self._send_cmd(s, {"cmd": "get_status"})
+                self._last_status_req = time.time()
+
                 while not self._control_stop and not self.detached:
-                    msg = self._recv_msg(s)
+                    try:
+                        msg = self._recv_msg(s)
+                    except socket.timeout:
+                        msg = False
                     if msg is None:
                         break
-                    self._handle_control_msg(msg)
+                    if msg is not False:
+                        self._handle_control_msg(msg)
+                    now = time.time()
+                    if now - self._last_status_req >= self._status_interval:
+                        self._last_status_req = now
+                        with self._control_lock:
+                            self._send_cmd(s, {"cmd": "get_status"})
 
             except Exception as e:
                 if not self._control_stop:
@@ -331,9 +362,41 @@ class Modem73Interface(TCPClientInterface):
             self._update_rx_stats(msg)
             return
 
+        if "population" in msg or "occupancy_pct" in msg:
+            self._update_channel_load(msg)
+            return
+
         # get_config reply: config fields at top level, with "ok": true
         if "payload_size" in msg:
             self._sync_from_config(msg)
+
+    def _update_channel_load(self, msg):
+        try:
+            pop = msg.get("population")
+            occ = msg.get("occupancy_pct")
+            if occ is not None:
+                self._occupancy_pct = max(0, min(100, int(occ)))
+            if pop is None:
+                return
+            pop = int(pop)
+            if pop < 0:
+                return
+            if pop == self._population:
+                return
+            self._population = pop
+            self.csma_population = pop
+            RNS.log(
+                f"Modem73Interface[{self.name}]: channel population {pop} "
+                f"other station(s), occupancy {self._occupancy_pct}%",
+                RNS.LOG_INFO,
+            )
+            if self._last_cfg is not None:
+                self._maybe_update_bitrate(self._last_cfg)
+        except Exception as e:
+            RNS.log(
+                f"Modem73Interface[{self.name}]: could not update channel load: {e}",
+                RNS.LOG_WARNING,
+            )
 
     def _update_rx_stats(self, msg):
         try:
@@ -357,6 +420,17 @@ class Modem73Interface(TCPClientInterface):
 
     def _sync_from_config(self, cfg):
         self._last_cfg = cfg
+        self.csma_enabled = bool(cfg.get("csma_enabled", self._csma_default))
+        mode = self._csma_mode(cfg)
+        if mode != getattr(self, "_csma_mode_seen", None):
+            self._csma_mode_seen = mode
+            names = {self.CSMA_THRESHOLD: "THRESHOLD", self.CSMA_SYNC: "SYNC",
+                     self.CSMA_RANKED: "RANKED"}
+            legacy = "" if cfg.get("csma_sync_only") is not None else " pre 2.3.0"
+            RNS.log(
+                f"Modem73Interface[{self.name}]: CSMA mode {names[mode]}{legacy}",
+                RNS.LOG_INFO,
+            )
 
         if "payload_size" in cfg:
             self._apply_payload_size(cfg["payload_size"])
@@ -386,17 +460,45 @@ class Modem73Interface(TCPClientInterface):
             return (int(payload) * 8 / air, air)
         return None
 
+    def _csma_mode(self, cfg):
+        sync = cfg.get("csma_sync_only")
+        if sync is None:
+            return self.CSMA_THRESHOLD
+        if not sync:
+            return self.CSMA_THRESHOLD
+        return self.CSMA_RANKED if cfg.get("csma_ranked") else self.CSMA_SYNC
+
+    def _dcd_detect_s(self, cfg):
+        if cfg.get("csma_fast_floor"):
+            return 0.55
+        return 0.78 if cfg.get("modem_type") == self.MODEM_ROBUST else 1.31
+
     def _csma_per_frame_overhead(self, cfg, airtime):
-        if not cfg.get("csma_enabled", True):
+        if not cfg.get("csma_enabled", self._csma_default):
             return 0.0
+        mode = self._csma_mode(cfg)
+        stations = max(1, self._population + 1)
+        slot_ms = max(1, int(cfg.get("slot_time_ms") or 500))
+
+        if mode == self.CSMA_RANKED:
+            worst_rank = (stations - 1) + (self.RANKED_YIELD_BUCKETS - 1)
+            return (self.RANKED_QUIET_S + worst_rank * self.RANKED_SLOT_S
+                    + self.LEAD_TONE_S)
+
         quiet_ms = cfg.get("csma_quiet_ms") or 0
         if quiet_ms <= 0:
             quiet_ms = min(max(airtime * 250.0, 300.0), 3500.0)
         cw = max(2, int(cfg.get("csma_cw") or 8))
-        slot_ms = max(1, int(cfg.get("slot_time_ms") or 500))
-        burst = max(1, min(4, int(cfg.get("csma_burst") or 1)))
-        access = quiet_ms / 1000.0 + (cw * slot_ms) / 2000.0 + self.CSMA_KEYUP_S
-        return access / burst + self.CSMA_BURST_GAP_S * (burst - 1) / burst
+        if mode == self.CSMA_SYNC:
+            det = self._dcd_detect_s(cfg)
+            slots = min(16, max(6, 3 * stations))
+            window = max(slots * (det + 0.15),
+                         cw * slot_ms / 500.0,
+                         16 * det,
+                         4 * slot_ms / 1000.0)
+        else:
+            window = cw * slot_ms / 1000.0
+        return quiet_ms / 1000.0 + window + self.CSMA_KEYUP_S
 
     def _timeout_bitrate(self, cfg):
         mt = cfg.get("modem_type")
@@ -414,7 +516,10 @@ class Modem73Interface(TCPClientInterface):
         phy, air = prof
         overhead = self._csma_per_frame_overhead(cfg, air)
         duty = air / (air + overhead) if overhead > 0 else 1.0
-        return max(8, int(phy * duty * self._timeout_margin))
+        share = 1.0
+        if cfg.get("csma_enabled", self._csma_default) and self._population > 0:
+            share = 1.0 / (1 + self._population)
+        return max(8, int(phy * duty * share * self._timeout_margin))
 
     def _maybe_update_bitrate(self, cfg):
         if not self._auto_bitrate:
@@ -452,9 +557,15 @@ class Modem73Interface(TCPClientInterface):
 
         if modem_type == self.MODEM_ROBUST:
             rm = cfg.get("robust_mode")
-            if rm is not None and rm < self.ROBUST_SHORT_OFFSET:
-                override = rm + self.ROBUST_SHORT_OFFSET
-                self._short_mtu = min(self._short_mtu, self.DEFAULT_SHORT_MTU)
+            short_rm = self.ROBUST_SHORT_MODE.get(rm)
+            if short_rm is not None:
+                override = short_rm
+                self._short_mtu = min(
+                    self._short_mtu_cfg,
+                    self.DEFAULT_SHORT_MTU - self.FRAG_HEADER_SIZE,
+                )
+            else:
+                self._short_mtu = self._short_mtu_cfg
 
         elif modem_type == self.MODEM_OFDM:
             if not cfg.get("short_frame", False):
@@ -487,8 +598,9 @@ class Modem73Interface(TCPClientInterface):
 
         if modem_type == self.MODEM_ROBUST:
             rm = cfg.get("robust_mode")
-            if rm is not None and rm < self.ROBUST_SHORT_OFFSET:
-                msg = {"cmd": "set_config", "robust_mode": rm + self.ROBUST_SHORT_OFFSET}
+            short_rm = self.ROBUST_SHORT_MODE.get(rm)
+            if short_rm is not None:
+                msg = {"cmd": "set_config", "robust_mode": short_rm}
         elif modem_type == self.MODEM_OFDM:
             if not cfg.get("short_frame", False):
                 msg = {"cmd": "set_config", "short_frame": True}
@@ -505,7 +617,7 @@ class Modem73Interface(TCPClientInterface):
                 self._send_cmd(sock, msg)
                 self._always_applied = True
                 RNS.log(
-                    f"Modem73Interface[{self.name}]: switched TNC to short-frame "
+                    f"Modem73Interface[{self.name}]: switched modem73 to short-frames "
                     f"mode ({msg})",
                     RNS.LOG_INFO,
                 )
