@@ -14,13 +14,7 @@ control_port = 8073
 ```
 where the target host, port, and control host and port are pointing to your runnning modem73 instance 
 
-## Notes ! IMPORTANT !
-When using modes that are slow, like the ROBUST HF modes or anything under 600 bps, Applications that use LXMF like MeshChat, MeshChatX, Sideband, and Columba need LXMF constants that are not tuned for slower interfaces. They will spam the queue with many path requests and retries on first opportunistic attempt (sending when they aren't in the path able, or not over a link).
-
-MeshChatX (https://github.com/Quad4-Software/MeshChatX/tree/dev) is the recommended application to use with modem73interface for general purpose Nomad nodes, and messaging 
-
-When available, send messages over a direct link versus sending LXMF messages opportunistically. Ensure that all peers known eachother in each's announce table and have a fresh understanding of the topology when using modem73 with Reticulum
-
+Be sure to upgrade to LXMF >1.2.0 when using modem73 for improved timing over slower bitrate modes 
 
 # Tips
 - All peers using modem73 should have eachother's announces in their  path table. It's best to  Announce each time rnsd or other Reticulum programs are spun up when using modem73 as an Interface. 
