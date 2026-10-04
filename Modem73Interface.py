@@ -33,7 +33,7 @@ class Modem73Interface(TCPClientInterface):
 
     DEFAULT_KISS_PORT     = 8001
     DEFAULT_CONTROL_PORT  = 8073
-    DEFAULT_MTU_OVERHEAD  = 15
+    DEFAULT_MTU_OVERHEAD  = 10
     DEFAULT_BITRATE       = 400
     DEFAULT_SHORT_MTU     = 170
     FRAG_HEADER_SIZE      = 5
